@@ -23,12 +23,17 @@ class ProgressiveRandomizedWalker2d(gym.Wrapper):
                  obs_noise_std=0.01,
                  torque_noise_std=0.02,
                  timestep_range=(1/400, 1/250),
-                 enable_timestep_randomization=True):
+                 enable_timestep_randomization=True,
+                 auto_expand_randomization=False,
+                 expand_every=750_000):
         super().__init__(env)
         self.total_timesteps = total_timesteps
         self.enable_timestep_randomization = enable_timestep_randomization
+        self.auto_expand_randomization = auto_expand_randomization
+        self.expand_every = expand_every
+        self.expansion_factor = 0.05
+        self.last_expansion_step = 0
 
-        # base (min) and max (final) ranges for progressive scaling
         self.param_ranges = dict(
             mass=(mass_range, (0.6, 1.4)),
             friction=(friction_range, (0.6, 1.4)),
@@ -39,11 +44,23 @@ class ProgressiveRandomizedWalker2d(gym.Wrapper):
         self.obs_noise_std_base = obs_noise_std
         self.torque_noise_std_base = torque_noise_std
         self.timestep_range_base = timestep_range
-        self.alpha = 0.0  # progression factor (0 to 1)
+        self.alpha = 0.0
         self.last_randomization_params = {}
 
     def set_progress(self, timestep):
         self.alpha = min(timestep / self.total_timesteps, 1.0)
+        # Optionally expand ranges
+        if self.auto_expand_randomization and timestep - self.last_expansion_step >= self.expand_every:
+            self._expand_randomization()
+            self.last_expansion_step = timestep
+
+    def _expand_randomization(self):
+        """Gradually widen randomization ranges."""
+        for key, (base, full) in self.param_ranges.items():
+            new_min = max(0.5, base[0] - self.expansion_factor)
+            new_max = min(1.5, base[1] + self.expansion_factor)
+            self.param_ranges[key] = ((new_min, new_max), full)
+        print(f"🔧 Expanded randomization ranges at {self.last_expansion_step} steps")
 
     def _interp_range(self, base, full):
         low = np.interp(self.alpha, [0, 1], [base[0], full[0]])
@@ -93,7 +110,6 @@ class ProgressiveRandomizedWalker2d(gym.Wrapper):
             if hasattr(robot, "motor_power"):
                 robot.motor_power *= np.random.uniform(*actuator_rng)
 
-            # Store current randomization for logging
             self.last_randomization_params = dict(
                 alpha=self.alpha,
                 mass_range=mass_rng,
@@ -109,58 +125,81 @@ class ProgressiveRandomizedWalker2d(gym.Wrapper):
 
 
 # =========================================================
-# Callback: Progressive Randomization + Logging to Excel
+# Callback: Logging, Plotting, and Randomization Progression
 # =========================================================
 class ProgressiveDRLoggingCallback(BaseCallback):
-    def __init__(self, env_wrapper, log_excel_path="training_log.xlsx", verbose=0):
+    def __init__(self, env_wrapper, log_excel_path="training_log.xlsx", plot_every=1_000_000, verbose=0):
         super().__init__(verbose)
         self.env_wrapper = env_wrapper
         self.log_excel_path = log_excel_path
+        self.plot_every = plot_every
         self.instant_rewards = []
         self.timesteps = []
         self.run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     def _on_step(self):
-        # Progressive domain randomization
         timestep = self.num_timesteps
         self.env_wrapper.set_progress(timestep)
         reward = float(self.locals.get("rewards", [0])[-1])
         self.instant_rewards.append(reward)
         self.timesteps.append(timestep)
+
+        # Plot every N steps
+        if timestep % self.plot_every == 0 and timestep > 0:
+            self._save_reward_plot(timestep)
         return True
 
+    def _save_reward_plot(self, timestep):
+        """Save convergence plot for instantaneous rewards."""
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.timesteps, self.instant_rewards, linewidth=1.2)
+        plt.title(f"Reward Convergence up to {timestep:,} Steps")
+        plt.xlabel("Timesteps")
+        plt.ylabel("Instantaneous Reward")
+        plt.grid(True)
+        plt.tight_layout()
+        fname = f"reward_convergence_{timestep//1_000_000}M.png"
+        plt.savefig(fname, dpi=300)
+        plt.close()
+        print(f"📈 Saved reward convergence plot: {fname}")
+
     def _on_training_end(self):
-        # Build log DataFrame
         df = pd.DataFrame({
             "timestep": self.timesteps,
             "instant_reward": self.instant_rewards,
         })
 
-        # Add current randomization info
+        # Add last randomization info
         rand_info = self.env_wrapper.last_randomization_params
         for key, val in rand_info.items():
             df[key] = str(val)
 
-        # Append or create Excel file
         mode = "a" if os.path.exists(self.log_excel_path) else "w"
-        with pd.ExcelWriter(self.log_excel_path, mode=mode, engine="openpyxl", if_sheet_exists="overlay") as writer:
-            df.to_excel(writer, sheet_name=f"Run_{self.run_id}", index=False)
+        writer = pd.ExcelWriter(self.log_excel_path, mode=mode, engine="openpyxl", if_sheet_exists="overlay")
+        with writer:
+            df.to_excel(writer, sheet_name="Rewards", index=False)
 
-        print(f"📊 Logged training data to {self.log_excel_path} (sheet: Run_{self.run_id})")
+        print(f"📊 Logged training data to {self.log_excel_path}")
 
 
 # =========================================================
 # Train or Resume PPO with Progressive DR
 # =========================================================
 ENV_ID = "Walker2DBulletEnv-v0"
-TOTAL_TIMESTEPS = 1_000_000
+# TOTAL_TIMESTEPS = 6_000_000
+TOTAL_TIMESTEPS = 10_000
 MODEL_PATH = "ppo_walker_progressive_dr.zip"
 VECNORM_PATH = "vec_normalize.pkl"
 EXCEL_LOG_PATH = "training_log.xlsx"
 SEED = 42
 
 base_env = gym.make(ENV_ID)
-dr_env = ProgressiveRandomizedWalker2d(base_env, total_timesteps=TOTAL_TIMESTEPS)
+dr_env = ProgressiveRandomizedWalker2d(
+    base_env,
+    total_timesteps=TOTAL_TIMESTEPS,
+    auto_expand_randomization=True,   # turn off for fixed ranges
+    expand_every=750_000              # widen ranges every 750k steps
+)
 vec_env = DummyVecEnv([lambda: dr_env])
 
 # Load or create VecNormalize
@@ -171,7 +210,7 @@ else:
     print("🚀 Initializing new VecNormalize...")
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
-callback = ProgressiveDRLoggingCallback(dr_env, log_excel_path=EXCEL_LOG_PATH)
+callback = ProgressiveDRLoggingCallback(dr_env, log_excel_path=EXCEL_LOG_PATH, plot_every=10_000)
 
 # Load or initialize model
 if os.path.exists(MODEL_PATH):
@@ -182,10 +221,9 @@ else:
     print("🚀 No checkpoint found. Starting fresh training...")
     model = PPO("MlpPolicy", vec_env, verbose=1, seed=SEED)
 
-# Train and save periodically
+# Train and save
 model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
 
-# Save model and VecNormalize stats
 model.save(MODEL_PATH)
 vec_env.save(VECNORM_PATH)
 print(f"✅ Model saved as {MODEL_PATH}")
